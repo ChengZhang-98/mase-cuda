@@ -1,6 +1,5 @@
 #include "c10/core/ScalarType.h"
 #include "c10/core/TensorOptions.h"
-#include "cute/arch/copy_sm80.hpp"
 #include "cute/config.hpp"
 #include "cute/pointer.hpp"
 #include <ATen/cuda/CUDAContext.h>
@@ -10,9 +9,16 @@
 #include <cute/tensor.hpp>
 #include <cute/tensor_impl.hpp>
 #include <cutlass/bfloat16.h>
-#include <set>
+#include <sys/stat.h>
 #include <thrust/host_vector.h>
 #include <torch/extension.h>
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ <= 750))
+#include "cute/arch/copy_sm75.hpp"
+#elif (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ <= 890))
+#include "cute/arch/copy_sm80.hpp"
+#else
+#include "cute/arch/copy_sm90.hpp"
+#endif
 #pragma once
 
 namespace mase_cuda {
@@ -24,16 +30,20 @@ __host__ void dequantize1d_host(TypeX const *x, const int M, TypeScale const *sc
     assert(M % group_size == 0);
 
     const int num_groups = M / group_size;
-    uint8_t const *x_raw_uint8 = reinterpret_cast<uint8_t const *>(x);
+    int8_t const *x_raw_int8 = reinterpret_cast<int8_t const *>(x);
     uint8_t const *scales_raw_uint8 = reinterpret_cast<uint8_t const *>(scales);
-    thrust::host_vector<uint8_t> hX(x_raw_uint8, x_raw_uint8 + M);
+    thrust::host_vector<int8_t> hX(x_raw_int8, x_raw_int8 + M);
     thrust::host_vector<uint8_t> hScales(scales_raw_uint8, scales_raw_uint8 + num_groups);
 
     for (int i = 0; i < M; ++i) {
         auto sign = static_cast<uint16_t>(hX[i] & 0x80) << 8;
         auto exp = static_cast<uint16_t>(hScales[i / group_size]) << 7;
-        auto mantissa = static_cast<uint16_t>((hX[i] << 1) & 0x7E);
-        y[i] = cutlass::bfloat16_t::bitcast(sign | exp | mantissa);
+        auto mantissa_abs = abs(hX[i]);
+        auto frac = static_cast<uint16_t>((mantissa_abs & 0x3F) << 1);
+        auto out = cutlass::bfloat16_t::bitcast(sign | exp | frac);
+        auto dont_need_abs = bool(mantissa_abs & 0x40);
+        auto bias = cutlass::bfloat16_t::bitcast(sign | exp | uint16_t(0));
+        y[i] = dont_need_abs ? out : out - bias;
     }
 }
 
@@ -64,9 +74,9 @@ __global__ static void dequantize1d_device(TypeX const *x, ShapeX shape_x, Strid
     static_assert(is_static<SmemLayoutX>::value);
     static_assert(is_static<SmemLayoutScale>::value);
 
-    uint8_t const *x_raw_uint8 = reinterpret_cast<uint8_t const *>(x);
+    int8_t const *x_raw_int8 = reinterpret_cast<int8_t const *>(x);
     uint8_t const *scales_raw_uint8 = reinterpret_cast<uint8_t const *>(scales);
-    Tensor mX_raw = make_tensor(make_gmem_ptr(x_raw_uint8), shape_x, stride_x);
+    Tensor mX_raw = make_tensor(make_gmem_ptr(x_raw_int8), shape_x, stride_x);
     Tensor mX = flatten(flat_divide(mX_raw, group_tiler)); // (_group_size, num_groups):(_1, _group_size)
     Tensor vScale = make_tensor(make_gmem_ptr(scales_raw_uint8), shape_scale, stride_scale); // (num_groups,)
     Tensor mY = make_tensor(make_gmem_ptr(y), shape(mX), stride(mX)); // (_group_size, num_groups):(_1, _group_size)
@@ -80,7 +90,7 @@ __global__ static void dequantize1d_device(TypeX const *x, ShapeX shape_x, Strid
     Tensor gScale = local_tile(vScale, select<1>(cta_tiler), select<1>(cta_coord)); // (BLK_K,)
     Tensor gY = local_tile(mY, cta_tiler, cta_coord);                               // (BLK_M, BLK_K)
 
-    __shared__ uint8_t smemX[size(cta_tiler)];
+    __shared__ int8_t smemX[size(cta_tiler)];
     __shared__ uint8_t smemScale[size(select<1>(cta_tiler))];
 
     Tensor sX = make_tensor(make_smem_ptr(smemX), cta_tiler);                    // (BLK_M, BLK_K)
@@ -130,8 +140,12 @@ __global__ static void dequantize1d_device(TypeX const *x, ShapeX shape_x, Strid
         auto scaleIdx = threadIdx.x / size<0>(layout_tX);
         auto exp = static_cast<uint16_t>(sScale[scaleIdx]) << 7;
         auto sign = static_cast<uint16_t>(tXsX[i] & 0x80) << 8;
-        auto mantissa = static_cast<uint16_t>((tXsX[i] << 1) & 0x7E);
-        tXrY[i] = cutlass::bfloat16_t::bitcast(sign | exp | mantissa);
+        auto mantissa_abs = abs(tXsX[i]);
+        auto frac = static_cast<uint16_t>((mantissa_abs & 0x3F) << 1);
+        auto out = cutlass::bfloat16_t::bitcast(sign | exp | frac);
+        auto bias = cutlass::bfloat16_t::bitcast(sign | exp | uint16_t(0));
+        auto dont_need_bias = bool(mantissa_abs & 0x40);
+        tXrY[i] = dont_need_bias ? out : out - bias;
     }
 
     // copy back

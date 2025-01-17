@@ -41,3 +41,27 @@ def dequantize1d(input: torch.Tensor, scale: torch.Tensor, group_size: int) -> t
         output = mase_cuda_ext.mxint8.dequantize1d(input, scale, group_size)
 
     return output
+
+
+def dequantize1d_simulated(input: torch.Tensor, scale: torch.Tensor, group_size: int) -> torch.Tensor:
+    assert input.ndim == 1, "Input tensor must be 1D"
+    assert scale.ndim == 1, "Scale tensor must be 1D"
+    input = input.view(torch.int8)
+    scale = scale.view(torch.uint8)
+
+    numel = input.numel()
+    num_groups = numel // group_size
+
+    mantissa = input.reshape(num_groups, group_size)
+    scales = scale.reshape(num_groups, 1)
+
+    sign = (mantissa & 0x80).to(torch.int16) << 8
+    exp = scales.to(torch.int16) << 7
+    mantissa_abs = mantissa.abs()
+    frac = ((mantissa_abs & 0x3F) << 1).view(torch.uint8).to(torch.int16)
+
+    output = (sign | exp | frac).view(torch.bfloat16)
+    dont_need_bias = (mantissa_abs & 0x40).bool()
+    bias = (sign | exp | 0x00).view(torch.bfloat16)
+    output = torch.where(dont_need_bias, output, output - bias).flatten()
+    return output

@@ -1,7 +1,6 @@
 import time
 import logging
 import random
-import json
 import tabulate
 import numpy as np
 import pytest
@@ -9,50 +8,13 @@ import ml_dtypes
 import torch
 from mase_cuda.constants import MASE_CUDA_ROOT_PATH
 
-from mase_cuda.mxint8.dequantize import dequantize1d
+from mase_cuda.mxint8.dequantize import dequantize1d, dequantize1d_simulated
+from mase_cuda.mxint8.quantize import quantize1d_simulated
 from mase_cuda.utils import seed_everything
 
 logger = logging.getLogger(__name__)
 
 seed_everything(42)
-
-
-def compose_mxint8_exp_mantissa_np(scale: np.ndarray, mantissa: np.ndarray):
-    assert scale.dtype == np.uint8
-    assert mantissa.dtype == np.uint8
-    assert scale.shape == mantissa.shape
-    mxint8 = np.zeros(scale.shape, dtype=np.uint16)
-    sign = (mantissa & 0x80).astype(np.uint16) << 8
-    mantissa = ((mantissa << 1) & 0x7E).astype(np.uint16)
-    exp = scale.astype(np.uint16) << 7
-    mxint8 = sign | exp | mantissa
-    mxint8 = mxint8.view(ml_dtypes.bfloat16)
-
-    return mxint8
-
-
-def dequantize1d_fake_pt(x: torch.Tensor, scales: torch.Tensor, group_size: int) -> torch.Tensor:
-    assert x.dtype == torch.uint8
-    assert scales.dtype == torch.uint8
-    assert x.shape[0] // group_size == scales.shape[0]
-
-    m = x.shape[0]
-    num_groups = m // group_size
-
-    x = x.reshape(num_groups, group_size)
-    scales = scales.view(num_groups, 1)
-
-    mxint8 = torch.zeros_like(x, dtype=torch.uint16)
-
-    sign = (x & 0x80).to(torch.int16) << 8
-    exp = scales.to(torch.int16) << 7
-    mantissa = ((x << 1) & 0x7E).to(torch.int16)
-
-    mxint8 = sign | exp | mantissa
-    mxint8 = mxint8.view(torch.bfloat16)
-
-    mxint8 = mxint8.reshape(m)
-    return mxint8
 
 
 def test_ext_dequantize1d():
@@ -72,7 +34,7 @@ def test_ext_dequantize1d():
 
                 # view as uint16 to avoid NaN comparison
                 out_cpu = dequantize1d(x, scales, group_size)
-                out_ref = dequantize1d_fake_pt(x, scales, group_size)
+                out_ref = dequantize1d_simulated(x, scales, group_size)
 
                 # find mismatch idx
                 if not torch.equal(out_cpu, out_ref):
@@ -121,7 +83,7 @@ def test_ext_dequantize1d_predication_fast():
 
                 # view as uint16 to avoid NaN comparison
                 out_cpu = dequantize1d(x, scales, group_size)
-                out_ref = dequantize1d_fake_pt(x, scales, group_size)
+                out_ref = dequantize1d_simulated(x, scales, group_size)
 
                 # find mismatch idx
                 if not torch.equal(out_cpu, out_ref):
@@ -173,7 +135,7 @@ def test_ext_dequantize1d_predication():
 
                 # view as uint16 to avoid NaN comparison
                 out_cpu = dequantize1d(x, scales, group_size)
-                out_ref = dequantize1d_fake_pt(x, scales, group_size)
+                out_ref = dequantize1d_simulated(x, scales, group_size)
 
                 # find mismatch idx
                 if not torch.equal(out_cpu, out_ref):
